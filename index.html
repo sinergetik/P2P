@@ -691,6 +691,37 @@
     } catch (e) {}
   }
 
+  // Запуск живого потока звука и видеокадров через наш рабочий канал MQTT
+  function startFallbackMediaLoop() {
+    callActive = true;
+    startCallTimer();
+    startVoiceStreamLoop();
+
+    if (videoFrameInterval) clearInterval(videoFrameInterval);
+    if (isVideoCall) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 160;
+      canvas.height = 220;
+      const ctx = canvas.getContext('2d');
+
+      videoFrameInterval = setInterval(() => {
+        if (!callActive || webrtcConnected || !camEnabled) return;
+        const lv = document.getElementById('local-video');
+        if (lv && lv.readyState >= 2) {
+          try {
+            ctx.drawImage(lv, 0, 0, canvas.width, canvas.height);
+            const jpg = canvas.toDataURL('image/jpeg', 0.4);
+            sendRaw({
+              type: 'call-vframe',
+              frame: jpg,
+              pktId: Math.random().toString(36)
+            });
+          } catch (e) {}
+        }
+      }, 450);
+    }
+  }
+
   function stopFallbackMediaLoop() {
     callActive = false;
     webrtcConnected = false;
@@ -764,7 +795,10 @@
   async function acceptIncomingCall() {
     unlockAudio();
     document.getElementById('btn-accept-call').style.display = 'none';
-    document.getElementById('call-sub-state').textContent = 'Соединяем звук и видео...';
+    document.getElementById('call-sub-state').textContent = 'На связи • 00:00';
+
+    // СРАЗУ отправляем сигнал звонящему, что трубка снята (до любых задержек камеры/микрофона)
+    sendRaw({ type: 'call-accepted', video: isVideoCall, pktId: Math.random().toString(36) });
 
     try {
       localStream = await acquireMedia(isVideoCall);
@@ -773,16 +807,16 @@
     }
     setupLocalPreview(isVideoCall);
 
-    // Запускаем резервный медиа-поток сразу, чтобы связь пошла мгновенно даже через LTE
+    // Запускаем поток голоса и видео + дублируем подтверждение для надежности в LTE
     startFallbackMediaLoop();
-
-    // Сообщаем звонящему, что мы нажали зеленую трубку и готовы принять WebRTC Offer
     sendRaw({ type: 'call-accepted', video: isVideoCall, pktId: Math.random().toString(36) });
   }
 
   // Как только собеседник нажал «Принять», инициатор создает и шлет WebRTC Offer
   async function initiateWebRtcOffer() {
-    document.getElementById('call-sub-state').textContent = 'Установка прямого потока...';
+    if (callActive) return; // Уже соединились
+    unlockAudio();
+    document.getElementById('call-sub-state').textContent = 'На связи • 00:00';
     startFallbackMediaLoop();
     const pc = createPeerConnection();
     pendingCandidates = [];
@@ -966,8 +1000,11 @@
       }
       return;
     }
-    if (data.type === 'call-pcm' && callActive && !webrtcConnected) {
-      if (data.pcm) {
+    if (data.type === 'call-pcm') {
+      if (!callActive) {
+        startFallbackMediaLoop();
+      }
+      if (!webrtcConnected && data.pcm) {
         playIncomingPcm(data.pcm, data.rate || 8000);
       }
       return;
