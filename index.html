@@ -541,20 +541,45 @@
       return;
     }
 
+    headerPeerStatus.textContent = 'Подключение...';
+
     try {
+      // Таймер безопасности: если публичный сервер долго думает, активируем интерфейс принудительно
+      let fallbackTimer = setTimeout(() => {
+        if (!mqttClient || !mqttClient.connected) enableLocalFallbackStatus();
+      }, 4000);
+
       mqttClient = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
-        keepalive: 60, reconnectPeriod: 2000,
-        clientId: 'p2p_node_' + myPin + '_' + Math.random().toString(16).slice(2, 6)
+        keepalive: 30, // Снизили тайм-аут для более быстрого обнаружения обрывов
+        reconnectPeriod: 2000,
+        clean: true,
+        clientId: 'p2p_node_' + myPin + '_' + Math.random().toString(16).slice(2, 8)
       });
+
       mqttClient.on('connect', () => {
+        clearTimeout(fallbackTimer);
         mqttClient.subscribe('p2p_direct_ru/' + myPin);
         netDot.classList.add('online');
         listNetDot.classList.add('online');
         headerPeerStatus.textContent = isConnected ? `в сети • Связь с #${connectedPin}` : '✔ PIN активен и ждёт звонка';
       });
+
+      mqttClient.on('reconnect', () => {
+        netDot.classList.remove('online');
+        listNetDot.classList.remove('online');
+        headerPeerStatus.textContent = 'Восстановление сети...';
+      });
+
+      mqttClient.on('offline', () => {
+        netDot.classList.remove('online');
+        listNetDot.classList.remove('online');
+        headerPeerStatus.textContent = 'Ожидание интернета...';
+      });
+
       mqttClient.on('error', () => {
         enableLocalFallbackStatus();
       });
+
       mqttClient.on('message', (topic, payload) => {
         try { onPacket(JSON.parse(payload.toString())); } catch (err) {}
       });
@@ -563,41 +588,48 @@
     }
   }
 
-  // Прямой движок WebRTC поверх нашего рабочего MQTT-канала
-  function createPeerConnection() {
-    if (rtcPc) {
-      try { rtcPc.close(); } catch (e) {}
+  // Принудительное переподключение при выходе браузера из фона или переключении Wi-Fi/LTE
+  window.addEventListener('online', () => {
+    if (mqttClient && !mqttClient.connected) {
+      mqttClient.reconnect();
+    } else if (!mqttClient) {
+      startNetwork();
     }
+  });
+
+  function createPeerConnection() {
+    if (rtcPc) rtcPc.close();
     rtcPc = new RTCPeerConnection(RTC_CONFIG);
 
-    rtcPc.onicecandidate = (ev) => {
-      if (ev.candidate) {
+    rtcPc.onicecandidate = e => {
+      if (e.candidate) {
         sendRaw({
           type: 'webrtc-ice',
-          candidate: ev.candidate,
+          candidate: e.candidate,
           pktId: Math.random().toString(36)
         });
       }
     };
 
-    rtcPc.ontrack = (ev) => {
-      const stream = ev.streams && ev.streams[0];
-      if (!stream) return;
-
-      const rv = document.getElementById('remote-video');
-      const ra = document.getElementById('remote-audio');
-
-      webrtcConnected = true;
-      document.getElementById('fallback-video').style.display = 'none';
-
-      if (ev.track.kind === 'video' || isVideoCall) {
-        rv.srcObject = stream;
-        rv.style.display = 'block';
-        document.getElementById('call-avatar-big').style.display = 'none';
-        rv.play().catch(() => {});
+    rtcPc.ontrack = e => {
+      const stream = e.streams[0];
+      if (e.track.kind === 'video') {
+        const rv = document.getElementById('remote-video');
+        if (rv) {
+          rv.srcObject = stream;
+          rv.style.display = 'block';
+          document.getElementById('call-avatar-big').style.display = 'none';
+          const fv = document.getElementById('fallback-video');
+          if (fv) fv.style.display = 'none';
+        }
       }
-      ra.srcObject = stream;
-      ra.play().catch(() => {});
+      if (e.track.kind === 'audio') {
+        const ra = document.getElementById('remote-audio');
+        if (ra) {
+          ra.srcObject = stream;
+          ra.play().catch(()=>{});
+        }
+      }
       startCallTimer();
     };
 
