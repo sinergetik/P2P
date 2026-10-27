@@ -359,7 +359,7 @@
   </div>
 
 <script>
-  // Перехват ошибки песочницы Canvas для внешних WebSocket
+  // Перехват ошибки песочницы Canvas
   window.addEventListener('error', (e) => {
     if (e.message && e.message.includes('SecurityError')) e.preventDefault();
   });
@@ -382,7 +382,6 @@
   let outTimer = null;
   let inFiles = {};
 
-  // Переменные для прямого WebRTC через наш рабочий канал MQTT
   let rtcPc = null;
   let localStream = null;
   let isVideoCall = false;
@@ -392,7 +391,6 @@
   let callTimerInt = null;
   let callSeconds = 0;
 
-  // Резервный поток видео и звука через MQTT (работает даже когда LTE блокирует WebRTC)
   let callActive = false;
   let webrtcConnected = false;
   let videoFrameInterval = null;
@@ -400,7 +398,7 @@
   let micProcessor = null;
   let micSource = null;
   let nextPlayTime = 0;
-  let speakerBoost = 2.8; // Усиление громкой связи по умолчанию включено
+  let speakerBoost = 2.8;
 
   const RTC_CONFIG = {
     iceCandidatePoolSize: 4,
@@ -411,8 +409,7 @@
       {
         urls: [
           'turn:openrelay.metered.ca:80',
-          'turn:openrelay.metered.ca:443',
-          'turn:openrelay.metered.ca:443?transport=tcp'
+          'turn:openrelay.metered.ca:443'
         ],
         username: 'openrelayproject',
         credential: 'openrelayproject'
@@ -528,11 +525,12 @@
     headerPeerStatus.textContent = isConnected ? `в сети • Связь с #${connectedPin}` : '✔ PIN активен (локальный / P2P режим)';
   }
 
-  // --- УЛУЧШЕННАЯ СИСТЕМА СЕТИ С АВТОПЕРЕКЛЮЧЕНИЕМ БРОКЕРОВ ---
-  // Если режим модема на планшете блокирует первый порт, приложение автоматически попробует второй.
+  // МУЛЬТИ-СЕРВЕРНАЯ СИСТЕМА ДЛЯ ОБХОДА РЕЖИМА МОДЕМА (LTE NAT)
   const BROKERS = [
-    'wss://broker.hivemq.com:8884/mqtt', 
-    'wss://broker.emqx.io:8084/mqtt'
+    'wss://broker.emqx.io:8084/mqtt',
+    'wss://broker.hivemq.com:8884/mqtt',
+    'wss://public.mqtthq.com:8084/mqtt',
+    'wss://test.mosquitto.org:8081/mqtt'
   ];
   let currentBrokerIndex = 0;
   let networkTimeout = null;
@@ -547,15 +545,18 @@
       return;
     }
 
-    headerPeerStatus.textContent = 'Подключение к сети...';
+    // Пишем какой сервер пробуем сейчас, чтобы процесс был виден
+    headerPeerStatus.textContent = `Поиск сети (канал ${currentBrokerIndex + 1}/${BROKERS.length})...`;
+    
     if (mqttClient) {
       try { mqttClient.end(true); } catch(e){}
     }
 
     try {
-      // Если через 4 секунды нет коннекта - меняем сервер и пробуем заново
+      // Если сервер заблокирован оператором, через 4 сек пробуем следующий
       networkTimeout = setTimeout(() => {
         if (!mqttClient || !mqttClient.connected) {
+          if (mqttClient) { try { mqttClient.end(true); } catch(e){} }
           currentBrokerIndex = (currentBrokerIndex + 1) % BROKERS.length;
           startNetwork();
         }
@@ -579,17 +580,15 @@
       mqttClient.on('reconnect', () => {
         netDot.classList.remove('online');
         listNetDot.classList.remove('online');
-        headerPeerStatus.textContent = 'Восстановление сети...';
       });
 
       mqttClient.on('offline', () => {
         netDot.classList.remove('online');
         listNetDot.classList.remove('online');
-        headerPeerStatus.textContent = 'Ожидание интернета...';
       });
 
       mqttClient.on('error', () => {
-        // Ошибка триггернет таймер и переключит брокер
+        // Ошибка вызовет таймер и переключит сервер
       });
 
       mqttClient.on('message', (topic, payload) => {
@@ -600,15 +599,9 @@
     }
   }
 
-  // Принудительное переподключение при выходе браузера из фона или переключении Wi-Fi/LTE
   window.addEventListener('online', () => {
-    if (mqttClient && !mqttClient.connected) {
-      startNetwork(); // Жесткий рестарт соединения
-    } else if (!mqttClient) {
-      startNetwork();
-    }
+    if (!mqttClient || !mqttClient.connected) startNetwork();
   });
-  // --- КОНЕЦ СИСТЕМЫ СЕТИ ---
 
   function createPeerConnection() {
     if (rtcPc) rtcPc.close();
@@ -657,101 +650,60 @@
     return rtcPc;
   }
 
-  // Генерация мини-WAV файла в памяти для разблокировки и воспроизведения через системный <audio> на iPhone
   function createWavUrlFromSamples(floatSamples, sampleRate) {
     const numSamples = floatSamples.length;
     const buffer = new ArrayBuffer(44 + numSamples * 2);
     const view = new DataView(buffer);
-
-    function writeStr(offset, str) {
-      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-    }
-
-    writeStr(0, 'RIFF');
-    view.setUint32(4, 36 + numSamples * 2, true);
-    writeStr(8, 'WAVE');
-    writeStr(12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true); // PCM
-    view.setUint16(22, 1, true); // Mono
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true); // 16-bit
-    writeStr(36, 'data');
-    view.setUint32(40, numSamples * 2, true);
-
+    function writeStr(offset, str) { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); }
+    writeStr(0, 'RIFF'); view.setUint32(4, 36 + numSamples * 2, true); writeStr(8, 'WAVE'); writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    writeStr(36, 'data'); view.setUint32(40, numSamples * 2, true);
     let offset = 44;
     for (let i = 0; i < numSamples; i++) {
       let s = Math.max(-1, Math.min(1, floatSamples[i] * speakerBoost));
       view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
       offset += 2;
     }
-
     const blob = new Blob([buffer], { type: 'audio/wav' });
     return URL.createObjectURL(blob);
   }
 
-  // Принудительная разблокировка динамика на iPhone / Android + проверочный сигнал
   function unlockAudio(playBeep = false) {
     try {
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      if (!audioCtx) {
-        audioCtx = new AudioContextClass();
-      }
-      if (audioCtx.state === 'suspended') {
-        audioCtx.resume();
-      }
-
+      if (!audioCtx) audioCtx = new AudioContextClass();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
       const hwRate = audioCtx.sampleRate || 44100;
       const bufLen = playBeep ? Math.floor(hwRate * 0.12) : 64;
       const buffer = audioCtx.createBuffer(1, bufLen, hwRate);
       const data = buffer.getChannelData(0);
-      if (playBeep) {
-        for (let i = 0; i < bufLen; i++) {
-          data[i] = Math.sin(2 * Math.PI * 660 * (i / hwRate)) * 0.25;
-        }
-      }
+      if (playBeep) { for (let i = 0; i < bufLen; i++) data[i] = Math.sin(2 * Math.PI * 660 * (i / hwRate)) * 0.25; }
       const source = audioCtx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(audioCtx.destination);
+      source.buffer = buffer; source.connect(audioCtx.destination);
       if (source.start) source.start(0);
 
-      // Также разблокируем системный элемент <audio> на iOS
       const wa = document.getElementById('wav-stream-audio');
       if (wa) {
-        wa.muted = false;
-        wa.volume = 1.0;
+        wa.muted = false; wa.volume = 1.0;
         const silentWav = createWavUrlFromSamples(playBeep ? data : new Float32Array(160), hwRate);
-        wa.src = silentWav;
-        wa.play().then(() => {
-          setTimeout(() => URL.revokeObjectURL(silentWav), 1000);
-        }).catch(() => {});
+        wa.src = silentWav; wa.play().then(() => setTimeout(() => URL.revokeObjectURL(silentWav), 1000)).catch(() => {});
       }
-
-      const ra = document.getElementById('remote-audio');
-      const rv = document.getElementById('remote-video');
-      if (ra) { ra.muted = false; ra.volume = 1.0; if (ra.srcObject) ra.play().catch(() => {}); }
-      if (rv) { rv.muted = false; rv.volume = 1.0; if (rv.srcObject) rv.play().catch(() => {}); }
     } catch (e) {}
   }
 
-  // Переключение кнопки Громкой связи (🔊) с визуальной подсветкой и тестовым звуком
   function toggleSpeakerphone() {
     const btn = document.getElementById('btn-spk');
     if (speakerBoost > 1.5) {
       speakerBoost = 1.0;
       btn.classList.remove('active-spk');
-      document.getElementById('call-sub-state').textContent = 'Динамик: обычный (100%)';
     } else {
       speakerBoost = 2.8;
       btn.classList.add('active-spk');
-      document.getElementById('call-sub-state').textContent = '🔊 Громкая связь ВКЛ (300%)';
     }
-    unlockAudio(true); // Издаем короткий "Пик", чтобы подтвердить работу динамика
+    unlockAudio(true);
   }
 
-  // Кодирование и декодирование живого звука (PCM Int8 8000 Гц) для прохождения через iOS без блокировок
   function startVoiceStreamLoop() {
     if (!localStream) return;
     try {
@@ -761,7 +713,6 @@
 
       micSource = audioCtx.createMediaStreamSource(localStream);
       micProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
-
       const inRate = audioCtx.sampleRate || 48000;
       const outRate = 8000;
       const ratio = inRate / outRate;
@@ -770,18 +721,14 @@
       micProcessor.onaudioprocess = (e) => {
         if (!callActive || !micEnabled) return;
         const input = e.inputBuffer.getChannelData(0);
-
-        // Отображаем уровень микрофона на зеленом индикаторе
         let sum = 0;
         for (let i = 0; i < input.length; i += 4) sum += Math.abs(input[i]);
         const avg = Math.min(100, Math.round((sum / (input.length / 4)) * 450));
         const meter = document.getElementById('voice-meter');
         if (meter) meter.style.width = avg + '%';
 
-        // Если чистый WebRTC уже передаёт звук напрямую, не дублируем
         if (webrtcConnected) return;
 
-        // Сжимаем звук до 8000 Гц (Int8) и отправляем легкими пакетами каждые ~250 мс
         for (let i = 0; i < input.length; i += ratio) {
           const s = Math.max(-1, Math.min(1, input[Math.floor(i)]));
           pcmQueue.push(Math.round((s + 1) * 127.5));
@@ -790,19 +737,10 @@
         if (pcmQueue.length >= 2200) {
           const chunk = pcmQueue.splice(0, 2200);
           let bin = '';
-          for (let j = 0; j < chunk.length; j++) {
-            bin += String.fromCharCode(chunk[j]);
-          }
-          sendRaw({
-            type: 'call-pcm',
-            rate: outRate,
-            pcm: btoa(bin),
-            pktId: Math.random().toString(36)
-          });
+          for (let j = 0; j < chunk.length; j++) bin += String.fromCharCode(chunk[j]);
+          sendRaw({ type: 'call-pcm', rate: outRate, pcm: btoa(bin), pktId: Math.random().toString(36) });
         }
       };
-
-      // Подключаем через нулевой уровень громкости, чтобы не слышать собственное эхо
       const zeroGain = audioCtx.createGain();
       zeroGain.gain.value = 0;
       micSource.connect(micProcessor);
@@ -811,7 +749,6 @@
     } catch (e) {}
   }
 
-  // Воспроизведение входящего пакета голоса с пересчетом частоты под iPhone (48000 Гц) + резерв через WAV <audio>
   function playIncomingPcm(base64Data, sampleRate) {
     try {
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -821,7 +758,6 @@
       const bin = atob(base64Data);
       const len = bin.length;
       if (len === 0) return;
-
       const inRate = sampleRate || 8000;
       const rawSamples = new Float32Array(len);
       let sum = 0;
@@ -830,18 +766,14 @@
         rawSamples[i] = val;
         if (i % 4 === 0) sum += Math.abs(val);
       }
-
-      // Показываем входящий голос на синем индикаторе
       const avg = Math.min(100, Math.round((sum / (len / 4)) * 500));
       const meterIn = document.getElementById('voice-meter-in');
       if (meterIn) meterIn.style.width = avg + '%';
 
-      // Пересчитываем (Resample) из 8000 Гц в родную частоту iPhone (например 48000 Гц)
       const hwRate = audioCtx.sampleRate || 44100;
       const outLen = Math.floor(len * (hwRate / inRate));
       const audioBuffer = audioCtx.createBuffer(1, outLen, hwRate);
       const channel = audioBuffer.getChannelData(0);
-
       for (let i = 0; i < outLen; i++) {
         const srcIdx = i * (inRate / hwRate);
         const idx0 = Math.floor(srcIdx);
@@ -850,55 +782,39 @@
         const sample = rawSamples[idx0] * (1 - frac) + rawSamples[idx1] * frac;
         channel[i] = Math.max(-1, Math.min(1, sample * speakerBoost));
       }
-
       const source = audioCtx.createBufferSource();
       source.buffer = audioBuffer;
       source.connect(audioCtx.destination);
-
       const now = audioCtx.currentTime;
-      if (nextPlayTime < now || nextPlayTime > now + 0.7) {
-        nextPlayTime = now + 0.02;
-      }
+      if (nextPlayTime < now || nextPlayTime > now + 0.7) nextPlayTime = now + 0.02;
       source.start(nextPlayTime);
       nextPlayTime += audioBuffer.duration;
 
-      // Дополнительно подаем WAV в системный <audio> для iOS, если WebAudio приглушен микрофоном
       const wa = document.getElementById('wav-stream-audio');
       if (wa && wa.paused) {
         const wavUrl = createWavUrlFromSamples(rawSamples, inRate);
         wa.src = wavUrl;
-        wa.play().then(() => {
-          setTimeout(() => URL.revokeObjectURL(wavUrl), 1500);
-        }).catch(() => {});
+        wa.play().then(() => setTimeout(() => URL.revokeObjectURL(wavUrl), 1500)).catch(() => {});
       }
     } catch (e) {}
   }
 
-  // Запуск живого потока звука и видеокадров через наш рабочий канал MQTT
   function startFallbackMediaLoop() {
     callActive = true;
     startCallTimer();
     startVoiceStreamLoop();
-
     if (videoFrameInterval) clearInterval(videoFrameInterval);
     if (isVideoCall) {
       const canvas = document.createElement('canvas');
-      canvas.width = 160;
-      canvas.height = 220;
+      canvas.width = 160; canvas.height = 220;
       const ctx = canvas.getContext('2d');
-
       videoFrameInterval = setInterval(() => {
         if (!callActive || webrtcConnected || !camEnabled) return;
         const lv = document.getElementById('local-video');
         if (lv && lv.readyState >= 2) {
           try {
             ctx.drawImage(lv, 0, 0, canvas.width, canvas.height);
-            const jpg = canvas.toDataURL('image/jpeg', 0.4);
-            sendRaw({
-              type: 'call-vframe',
-              frame: jpg,
-              pktId: Math.random().toString(36)
-            });
+            sendRaw({ type: 'call-vframe', frame: canvas.toDataURL('image/jpeg', 0.4), pktId: Math.random().toString(36) });
           } catch (e) {}
         }
       }, 450);
@@ -906,16 +822,12 @@
   }
 
   function stopFallbackMediaLoop() {
-    callActive = false;
-    webrtcConnected = false;
-    nextPlayTime = 0;
+    callActive = false; webrtcConnected = false; nextPlayTime = 0;
     if (videoFrameInterval) { clearInterval(videoFrameInterval); videoFrameInterval = null; }
     if (micProcessor) { try { micProcessor.disconnect(); } catch (e) {} micProcessor = null; }
     if (micSource) { try { micSource.disconnect(); } catch (e) {} micSource = null; }
-    const meter = document.getElementById('voice-meter');
-    if (meter) meter.style.width = '0%';
-    const meterIn = document.getElementById('voice-meter-in');
-    if (meterIn) meterIn.style.width = '0%';
+    const meter = document.getElementById('voice-meter'); if (meter) meter.style.width = '0%';
+    const meterIn = document.getElementById('voice-meter-in'); if (meterIn) meterIn.style.width = '0%';
   }
 
   function startCallTimer() {
@@ -946,10 +858,7 @@
       });
     } catch (err) {
       if (withVideo) {
-        // Если камера занята (например, на одном и том же телефоне), берем хотя бы микрофон
-        try {
-          return await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-        } catch (e2) {}
+        try { return await navigator.mediaDevices.getUserMedia({ audio: true, video: false }); } catch (e2) {}
       }
       throw err;
     }
@@ -963,17 +872,11 @@
     }
     unlockAudio();
     isVideoCall = !!withVideo;
-    try {
-      localStream = await acquireMedia(isVideoCall);
-    } catch (err) {
-      addBubble('❌ Разрешите доступ к микрофону/камере в браузере для звонка', 'sys');
-      return;
-    }
+    try { localStream = await acquireMedia(isVideoCall); }
+    catch (err) { addBubble('❌ Разрешите доступ к микрофону/камере в браузере для звонка', 'sys'); return; }
 
     showCallModal(`Собеседник #${connectedPin}`, isVideoCall ? 'Вызов по видео...' : 'Голосовой вызов...', false, isVideoCall);
     setupLocalPreview(isVideoCall);
-
-    // Оповещаем второй браузер о входящем звонке
     sendRaw({ type: 'call-invite', video: isVideoCall, pktId: Math.random().toString(36) });
   }
 
@@ -981,69 +884,39 @@
     unlockAudio();
     document.getElementById('btn-accept-call').style.display = 'none';
     document.getElementById('call-sub-state').textContent = 'На связи • 00:00';
-
-    // СРАЗУ отправляем сигнал звонящему, что трубка снята (до любых задержек камеры/микрофона)
     sendRaw({ type: 'call-accepted', video: isVideoCall, pktId: Math.random().toString(36) });
-
-    try {
-      localStream = await acquireMedia(isVideoCall);
-    } catch (err) {
-      localStream = null;
-    }
+    try { localStream = await acquireMedia(isVideoCall); } catch (err) { localStream = null; }
     setupLocalPreview(isVideoCall);
-
-    // Запускаем поток голоса и видео + дублируем подтверждение для надежности в LTE
     startFallbackMediaLoop();
     sendRaw({ type: 'call-accepted', video: isVideoCall, pktId: Math.random().toString(36) });
   }
 
-  // Как только собеседник нажал «Принять», инициатор создает и шлет WebRTC Offer
   async function initiateWebRtcOffer() {
-    if (callActive) return; // Уже соединились
+    if (callActive) return;
     unlockAudio();
     document.getElementById('call-sub-state').textContent = 'На связи • 00:00';
     startFallbackMediaLoop();
     const pc = createPeerConnection();
     pendingCandidates = [];
-
-    if (localStream) {
-      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-    }
-
+    if (localStream) localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
     try {
       const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: isVideoCall });
       await pc.setLocalDescription(offer);
-      sendRaw({
-        type: 'webrtc-offer',
-        sdp: pc.localDescription,
-        video: isVideoCall,
-        pktId: Math.random().toString(36)
-      });
+      sendRaw({ type: 'webrtc-offer', sdp: pc.localDescription, video: isVideoCall, pktId: Math.random().toString(36) });
     } catch (e) {}
   }
 
   async function handleWebRtcOffer(data) {
     isVideoCall = !!data.video;
     const pc = createPeerConnection();
-
-    if (localStream) {
-      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-    }
-
+    if (localStream) localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-      for (const c of pendingCandidates) {
-        try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
-      }
+      for (const c of pendingCandidates) { try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {} }
       pendingCandidates = [];
-
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      sendRaw({
-        type: 'webrtc-answer',
-        sdp: pc.localDescription,
-        pktId: Math.random().toString(36)
-      });
+      sendRaw({ type: 'webrtc-answer', sdp: pc.localDescription, pktId: Math.random().toString(36) });
     } catch (e) {}
   }
 
@@ -1051,9 +924,7 @@
     if (!rtcPc) return;
     try {
       await rtcPc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-      for (const c of pendingCandidates) {
-        try { await rtcPc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
-      }
+      for (const c of pendingCandidates) { try { await rtcPc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {} }
       pendingCandidates = [];
     } catch (e) {}
   }
@@ -1070,9 +941,7 @@
   function setupLocalPreview(withVideo) {
     const lv = document.getElementById('local-video');
     if (withVideo && localStream && localStream.getVideoTracks().length > 0) {
-      lv.srcObject = localStream;
-      lv.style.display = 'block';
-      lv.play().catch(() => {});
+      lv.srcObject = localStream; lv.style.display = 'block'; lv.play().catch(() => {});
     } else {
       lv.style.display = 'none';
     }
@@ -1093,36 +962,25 @@
   }
 
   function endCall(notifyPeer) {
-    if (notifyPeer && connectedPin) {
-      sendRaw({ type: 'call-end', pktId: Math.random().toString(36) });
-    }
+    if (notifyPeer && connectedPin) sendRaw({ type: 'call-end', pktId: Math.random().toString(36) });
     stopFallbackMediaLoop();
-    clearInterval(callTimerInt);
-    callTimerInt = null;
+    clearInterval(callTimerInt); callTimerInt = null;
     if (rtcPc) { try { rtcPc.close(); } catch (e) {} rtcPc = null; }
     if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
     pendingCandidates = [];
-
-    const rv = document.getElementById('remote-video');
-    const fv = document.getElementById('fallback-video');
-    const lv = document.getElementById('local-video');
-    const ra = document.getElementById('remote-audio');
+    const rv = document.getElementById('remote-video'); const fv = document.getElementById('fallback-video');
+    const lv = document.getElementById('local-video'); const ra = document.getElementById('remote-audio');
     rv.srcObject = null; rv.style.display = 'none';
     if (fv) { fv.src = ''; fv.style.display = 'none'; }
-    lv.srcObject = null; lv.style.display = 'none';
-    ra.srcObject = null;
-
+    lv.srcObject = null; lv.style.display = 'none'; ra.srcObject = null;
     document.getElementById('call-modal').classList.remove('active');
   }
 
   function sendRaw(obj) {
     if (!connectedPin) return;
-    obj.from = myPin;
-    obj.to = connectedPin;
+    obj.from = myPin; obj.to = connectedPin;
     if (localBus) { try { localBus.postMessage(obj); } catch (e) {} }
-    if (mqttClient && mqttClient.connected) {
-      mqttClient.publish('p2p_direct_ru/' + connectedPin, JSON.stringify(obj), { qos: 0 });
-    }
+    if (mqttClient && mqttClient.connected) mqttClient.publish('p2p_direct_ru/' + connectedPin, JSON.stringify(obj), { qos: 0 });
   }
 
   function startConnect() {
@@ -1143,61 +1001,32 @@
     if (data.pktId && window._lastPkt === data.pktId) return;
     if (data.pktId) window._lastPkt = data.pktId;
 
-    if (data.type === 'ping') {
-      markConnected(data.from);
-      sendRaw({ type: 'pong', pktId: Math.random().toString(36) });
-      return;
-    }
+    if (data.type === 'ping') { markConnected(data.from); sendRaw({ type: 'pong', pktId: Math.random().toString(36) }); return; }
     if (data.type === 'pong') { markConnected(data.from); return; }
     if (data.type === 'bye') { resetUI(); return; }
 
     if (!isConnected) markConnected(data.from);
 
-    // Обработка сигналов звонка и WebRTC через наш надежный канал
     if (data.type === 'call-invite') {
       isVideoCall = !!data.video;
       showCallModal(`Собеседник #${data.from}`, isVideoCall ? 'Входящий видеозвонок...' : 'Входящий аудиозвонок...', true, isVideoCall);
       return;
     }
-    if (data.type === 'call-accepted') {
-      initiateWebRtcOffer();
-      return;
-    }
-    if (data.type === 'webrtc-offer') {
-      handleWebRtcOffer(data);
-      return;
-    }
-    if (data.type === 'webrtc-answer') {
-      handleWebRtcAnswer(data);
-      return;
-    }
-    if (data.type === 'webrtc-ice') {
-      handleWebRtcIce(data);
-      return;
-    }
-    // Прием резервных видеокадров и живого звука PCM напрямую через MQTT (работает на iOS и LTE)
+    if (data.type === 'call-accepted') { initiateWebRtcOffer(); return; }
+    if (data.type === 'webrtc-offer') { handleWebRtcOffer(data); return; }
+    if (data.type === 'webrtc-answer') { handleWebRtcAnswer(data); return; }
+    if (data.type === 'webrtc-ice') { handleWebRtcIce(data); return; }
     if (data.type === 'call-vframe' && callActive && !webrtcConnected) {
       const fv = document.getElementById('fallback-video');
-      if (fv && data.frame) {
-        fv.src = data.frame;
-        fv.style.display = 'block';
-        document.getElementById('call-avatar-big').style.display = 'none';
-      }
+      if (fv && data.frame) { fv.src = data.frame; fv.style.display = 'block'; document.getElementById('call-avatar-big').style.display = 'none'; }
       return;
     }
     if (data.type === 'call-pcm') {
-      if (!callActive) {
-        startFallbackMediaLoop();
-      }
-      if (!webrtcConnected && data.pcm) {
-        playIncomingPcm(data.pcm, data.rate || 8000);
-      }
+      if (!callActive) startFallbackMediaLoop();
+      if (!webrtcConnected && data.pcm) playIncomingPcm(data.pcm, data.rate || 8000);
       return;
     }
-    if (data.type === 'call-end') {
-      endCall(false);
-      return;
-    }
+    if (data.type === 'call-end') { endCall(false); return; }
 
     if (data.type === 'text') {
       const t = nowTime();
