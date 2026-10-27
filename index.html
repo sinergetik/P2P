@@ -201,7 +201,7 @@
         </div>
         <div class="peer-info">
           <div id="header-peer-name" class="peer-name">Прямой P2P Чат</div>
-          <div id="header-peer-status" class="peer-status">Подключение к сети...</div>
+          <div id="header-peer-status" class="peer-status">Запуск приложения...</div>
         </div>
       </div>
       <div class="chat-header-icons">
@@ -528,36 +528,48 @@
     headerPeerStatus.textContent = isConnected ? `в сети • Связь с #${connectedPin}` : '✔ PIN активен (локальный / P2P режим)';
   }
 
+  // --- УЛУЧШЕННАЯ СИСТЕМА СЕТИ С АВТОПЕРЕКЛЮЧЕНИЕМ БРОКЕРОВ ---
+  // Если режим модема на планшете блокирует первый порт, приложение автоматически попробует второй.
+  const BROKERS = [
+    'wss://broker.hivemq.com:8884/mqtt', 
+    'wss://broker.emqx.io:8084/mqtt'
+  ];
+  let currentBrokerIndex = 0;
+  let networkTimeout = null;
+
   function startNetwork() {
-    // Проверка: если код запущен внутри песочницы Canvas/Preview, где запрещены внешние WebSocket,
-    // сразу активируем локальную шину без вызова ошибки SecurityError
-    const isRestrictedSandbox =
-      window.location.protocol === 'blob:' ||
-      window.location.hostname.includes('scf.usercontent.goog') ||
-      window.location.hostname.includes('googleusercontent.com');
+    const isRestrictedSandbox = window.location.protocol === 'blob:' || 
+                                window.location.hostname.includes('scf.usercontent.goog') || 
+                                window.location.hostname.includes('googleusercontent.com');
 
     if (isRestrictedSandbox || typeof mqtt === 'undefined') {
       enableLocalFallbackStatus();
       return;
     }
 
-    headerPeerStatus.textContent = 'Подключение...';
+    headerPeerStatus.textContent = 'Подключение к сети...';
+    if (mqttClient) {
+      try { mqttClient.end(true); } catch(e){}
+    }
 
     try {
-      // Таймер безопасности: если публичный сервер долго думает, активируем интерфейс принудительно
-      let fallbackTimer = setTimeout(() => {
-        if (!mqttClient || !mqttClient.connected) enableLocalFallbackStatus();
+      // Если через 4 секунды нет коннекта - меняем сервер и пробуем заново
+      networkTimeout = setTimeout(() => {
+        if (!mqttClient || !mqttClient.connected) {
+          currentBrokerIndex = (currentBrokerIndex + 1) % BROKERS.length;
+          startNetwork();
+        }
       }, 4000);
 
-      mqttClient = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
-        keepalive: 30, // Снизили тайм-аут для более быстрого обнаружения обрывов
+      mqttClient = mqtt.connect(BROKERS[currentBrokerIndex], {
+        keepalive: 20,
         reconnectPeriod: 2000,
         clean: true,
         clientId: 'p2p_node_' + myPin + '_' + Math.random().toString(16).slice(2, 8)
       });
 
       mqttClient.on('connect', () => {
-        clearTimeout(fallbackTimer);
+        clearTimeout(networkTimeout);
         mqttClient.subscribe('p2p_direct_ru/' + myPin);
         netDot.classList.add('online');
         listNetDot.classList.add('online');
@@ -577,7 +589,7 @@
       });
 
       mqttClient.on('error', () => {
-        enableLocalFallbackStatus();
+        // Ошибка триггернет таймер и переключит брокер
       });
 
       mqttClient.on('message', (topic, payload) => {
@@ -591,11 +603,12 @@
   // Принудительное переподключение при выходе браузера из фона или переключении Wi-Fi/LTE
   window.addEventListener('online', () => {
     if (mqttClient && !mqttClient.connected) {
-      mqttClient.reconnect();
+      startNetwork(); // Жесткий рестарт соединения
     } else if (!mqttClient) {
       startNetwork();
     }
   });
+  // --- КОНЕЦ СИСТЕМЫ СЕТИ ---
 
   function createPeerConnection() {
     if (rtcPc) rtcPc.close();
